@@ -2,10 +2,12 @@ import { useState } from 'react';
 import axios from 'axios';
 import './App.css';
 import ProductCard from './components/ProductCard';
+import ProductModal from './components/ProductModal';
 import Dashboard from './components/Dashboard';
 import Comparison from './components/Comparison';
 import FilterPanel from './components/FilterPanel';
 import { BarChart3, GitCompare } from 'lucide-react';
+import { AnimatePresence } from 'framer-motion';
 
 // Configure axios base URL
 axios.defaults.baseURL = 'http://localhost:8000';
@@ -18,6 +20,9 @@ function App() {
 
   // Dashboard state
   const [showDashboard, setShowDashboard] = useState(false);
+
+  // Modal State
+  const [selectedProduct, setSelectedProduct] = useState(null);
 
   // Comparison state
   const [selectedForComparison, setSelectedForComparison] = useState([]);
@@ -33,6 +38,7 @@ function App() {
     e.preventDefault();
     if (!query.trim()) return;
 
+    const startTime = performance.now();
     setLoading(true);
     setError(null);
     setResults(null);
@@ -46,6 +52,9 @@ function App() {
 
       const response = await axios.get(`/search`, { params });
       setResults(response.data);
+
+      const searchTime = ((performance.now() - startTime) / 1000).toFixed(2);
+      console.log(`⚡ Search completed in ${searchTime}s`);
     } catch (err) {
       console.error(err);
       setError('Failed to fetch recommendations. Ensure backend is running.');
@@ -166,10 +175,12 @@ function App() {
           {results?.results.map((item, index) => (
             <ProductCard
               key={index}
+              index={index}
               product={item}
               rawRecs={results.raw_recs[index]}
-              isSelected={selectedForComparison.includes(results.raw_recs[index].id)}
-              onToggleCompare={() => toggleComparisonSelection(results.raw_recs[index].id)}
+              isSelected={selectedForComparison.includes(results.raw_recs[index]?.id)}
+              onToggleCompare={() => toggleComparisonSelection(results.raw_recs[index]?.id)}
+              onSelect={() => setSelectedProduct(results.raw_recs[index])}
             />
           ))}
         </div>
@@ -187,6 +198,16 @@ function App() {
           onClose={() => setShowComparison(false)}
         />
       )}
+
+      {/* Product Detail Modal */}
+      <AnimatePresence>
+        {selectedProduct && (
+          <ProductModal
+            data={selectedProduct}
+            onClose={() => setSelectedProduct(null)}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }

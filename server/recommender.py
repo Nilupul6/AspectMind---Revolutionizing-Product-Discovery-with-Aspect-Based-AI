@@ -12,6 +12,8 @@ from sklearn.neighbors import NearestNeighbors
 import joblib
 import threading
 import time
+from functools import lru_cache
+import hashlib
 
 # Constants
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -58,6 +60,12 @@ class ProductRecommender:
         print("Preparing Data & Index...")
         self.df = self._prepare_data()
         self._prepare_embeddings_and_index()
+        
+        # Query result cache for faster repeated searches
+        self.query_cache = {}  # {query_hash: (result, timestamp)}
+        self.cache_max_size = 100
+        self.cache_ttl = 3600  # 1 hour
+        
         print("Initialization Complete.")
 
     def _load_data_cache(self):
@@ -285,19 +293,60 @@ class ProductRecommender:
         if embeddings is None:
             print("Creating new embeddings...")
             texts = unique_df["enriched_text"].tolist()
+            # Normalize embeddings for cosine similarity using FAISS
             embeddings = self.sbert.encode(texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True)
+            # Ensure type is float32 for FAISS
+            embeddings = embeddings.astype('float32')
+            # Normalize for Cosine Similarity
+            import faiss
+            faiss.normalize_L2(embeddings)
+            
             np.save(self.emb_path, embeddings)
-
-        if os.path.exists(self.knn_path):
-            print("Loading KNN model...")
-            self.knn_index = joblib.load(self.knn_path)
-        else:
-            print("Building KNN index...")
-            self.knn_index = NearestNeighbors(n_neighbors=50, metric='cosine', algorithm='auto')
-            self.knn_index.fit(embeddings)
-            joblib.dump(self.knn_index, self.knn_path)
+        
+        # Build FAISS Index (Much faster than KNN)
+        self.index_path = os.path.join(EMB_DIR, "faiss_index.bin")
+        try:
+            import faiss
+            if os.path.exists(self.index_path):
+                print("Loading FAISS index...")
+                self.index = faiss.read_index(self.index_path)
+            else:
+                print("Building FAISS index...")
+                d = embeddings.shape[1]
+                self.index = faiss.IndexFlatIP(d) # Inner Product (Cosine Sim if normalized)
+                self.index.add(embeddings)
+                faiss.write_index(self.index, self.index_path)
+        except ImportError:
+            print("⚠️ FAISS not installed. Falling back to KNN.")
+            # Fallback to KNN if FAISS missing
+            if os.path.exists(self.knn_path):
+                 self.knn_index = joblib.load(self.knn_path)
+            else:
+                 self.knn_index = NearestNeighbors(n_neighbors=50, metric='cosine', algorithm='auto')
+                 self.knn_index.fit(embeddings)
+                 joblib.dump(self.knn_index, self.knn_path)
+            self.index = None
 
     def recommend(self, user_query, top_n_results=10, category_filter=None, min_sentiment_score=None, sort_by="relevance"):
+        # === CACHE CHECK ===
+        cache_key = hashlib.md5(f"{user_query}_{category_filter}_{min_sentiment_score}_{sort_by}".encode()).hexdigest()
+        
+        # Check if cached result exists and is still valid
+        if cache_key in self.query_cache:
+            result, timestamp = self.query_cache[cache_key]
+            if time.time() - timestamp < self.cache_ttl:
+                print(f"⚡ Cache HIT for query: '{user_query[:30]}...'")
+                return result
+        
+        # Clean old cache entries if cache is too large
+        if len(self.query_cache) > self.cache_max_size:
+            # Remove oldest entries
+            sorted_items = sorted(self.query_cache.items(), key=lambda x: x[1][1])
+            for key, _ in sorted_items[:20]:  # Remove 20 oldest
+                del self.query_cache[key]
+        
+        print(f"🔍 Processing query: '{user_query[:50]}...'")
+        
         # 1. Analyze Query
         query_aspects = self._infer_user_aspects(user_query)
         user_comment_analysis = self._format_user_aspect_sentiment(query_aspects)
@@ -305,8 +354,18 @@ class ProductRecommender:
         
         # 2. Semantic Search (Fetch more candidates to allow reranking)
         query_emb = self.sbert.encode(user_query, convert_to_numpy=True).reshape(1, -1)
-        # Fetch 3x candidates to allow for re-ranking filtering (Optimized from 5x for speed)
-        distances, indices = self.knn_index.kneighbors(query_emb, n_neighbors=min(top_n_results * 3, len(self.item_ids)))
+        
+        cands_count = min(top_n_results * 3, len(self.item_ids))
+        
+        if hasattr(self, 'index') and self.index is not None:
+            import faiss
+            # Normalize query for Cosine Similarity (Inner Product)
+            faiss.normalize_L2(query_emb)
+            distances, indices = self.index.search(query_emb, cands_count)
+            is_faiss = True
+        else:
+            distances, indices = self.knn_index.kneighbors(query_emb, n_neighbors=cands_count)
+            is_faiss = False
 
         candidates = []
         query_aspect_names = set(qa[0] for qa in query_aspects)
@@ -324,15 +383,14 @@ class ProductRecommender:
             except: aspects = {}
 
             # 3. Calculate Boost
-            # Boost if product has a query aspect as POSITIVE
             boost = 0.0
             for qa_name in query_aspect_names:
                 if qa_name in aspects:
                     attr = aspects[qa_name]
                     if attr.get("sentiment") == "Positive":
-                        boost += 0.15 # Boost for positive match
+                        boost += 0.15
                     elif attr.get("sentiment") == "Negative":
-                        boost -= 0.05 # Slight penalty if negative match to query aspect
+                        boost -= 0.05
             
             # Calculate sentiment score for filtering
             pos_count = sum(1 for v in aspects.values() if v.get("sentiment") == "Positive")
@@ -345,53 +403,50 @@ class ProductRecommender:
                 continue
             
             # Base semantic score + boost
-            final_score = float(1 - dist) + boost
+            if is_faiss:
+                final_score = float(dist) + boost
+            else:
+                final_score = float(1 - dist) + boost
 
             candidates.append({
                 "id": item_id,
                 "name": row["itemName"],
                 "category": row["category"],
                 "image": str(row["image"]) if pd.notna(row.get("image")) else "",
+                "description": str(row.get("description", "")),
+                "feature": str(row.get("feature", "")),
                 "score": final_score,
                 "sentiment_score": sentiment_score,
-                "aspects": aspects, # Raw aspects from DB
-                "row_ref": row, # temp ref for fallback
-                "text_for_ce": str(row["itemName"]) + " " + str(row["description"]) # Text for Cross-Encoder
+                "aspects": aspects,
+                "row_ref": row,
+                "text_for_ce": str(row["itemName"]) + " " + str(row.get("description", ""))[:200]  # Limit text length for speed
             })
 
         # 4. Re-Ranking with Cross-Encoder (Accuracy Boost)
-        # Re-rank strictly the top 50 (or whatever we fetched)
-        # Cross-Encoder takes pairs: [(query, doc1), (query, doc2), ...]
+        # ⚡ SPEED OPTIMIZATION: Only rerank top 30 candidates instead of all
         if candidates:
-            # We only re-rank the candidates we have safely retrieved
-            ce_pairs = [[user_query, c["text_for_ce"]] for c in candidates]
+            # Sort by initial score and take top 30 for cross-encoder reranking
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            top_candidates_for_rerank = candidates[:min(30, len(candidates))]
+            
+            ce_pairs = [[user_query, c["text_for_ce"]] for c in top_candidates_for_rerank]
             ce_scores = self.cross_encoder.predict(ce_pairs)
             
-            # Combine scores. 
-            # CE score is usually logits (unbounded) or 0-1 (if sigmoid). ms-marco are logits.
-            # Simple approach: Replace score with CE score, or weighted sum.
-            # Since CE is much better, we normally trust it primarily for ranking.
-            # But we keep the boost logic from before as a tie-breaker or penalty?
-            # Actually, let's trust CE for the base rank, apply aspect boost on top of normalized CE score.
-            
             # Normalize CE scores roughly to 0-1 for safer boosting
-            # Sigmoid: 1 / (1 + exp(-x))
             import math
             def sigmoid(x): return 1 / (1 + math.exp(-x))
             
-            for i, c in enumerate(candidates):
+            for i, c in enumerate(top_candidates_for_rerank):
                 base_score = sigmoid(ce_scores[i])
                 
-                # Re-apply aspect boost (from previous step, it was mixed in final_score)
-                # We need to recalculate boost or extract it.
-                # Let's just recalculate to be clean.
+                # Re-apply aspect boost
                 boost = 0.0
                 query_aspect_names = set(qa[0] for qa in query_aspects)
                 for qa_name in query_aspect_names:
                     if qa_name in c["aspects"]:
                         attr = c["aspects"][qa_name]
                         if attr.get("sentiment") == "Positive":
-                            boost += 0.1 # Slightly lower boost since CE is smart
+                            boost += 0.1
                         elif attr.get("sentiment") == "Negative":
                             boost -= 0.1
 
@@ -466,13 +521,18 @@ class ProductRecommender:
         # Get available categories for filtering
         available_categories = sorted(list(set(self.unique_df["category"].astype(str).unique())))
 
-        return self._sanitize_for_json({
+        result = self._sanitize_for_json({
             "query_analysis": user_comment_analysis,
             "overall_sentiment": overall_sentiment,
             "results": results,
             "raw_recs": final_recs,
             "available_categories": available_categories
         })
+        
+        # === CACHE RESULT ===
+        self.query_cache[cache_key] = (result, time.time())
+        
+        return result
     
     
     def add_feedback(self, product_id, feedback_text):
